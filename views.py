@@ -2,23 +2,33 @@ from django.shortcuts import render
 from django.http import JsonResponse ,HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
-from .models import vc_n_asn ,VcMaster , VcDatabase ,EslPart , AsnSchedule , WorkTable
+from .models import vc_n_asn ,VcMaster , VcDatabase ,EslPart , AsnSchedule , WorkTable ,trolley_data
 import requests
 from collections import deque
 from django.utils import timezone
 from django.core.exceptions import ObjectDoesNotExist
-
+from django.db.models import Count, Exists, OuterRef ,Q
+import time
 import json
 from itertools import cycle
+from django.shortcuts import get_object_or_404
+
+# Assuming your trolley model is `Trolley`
+
 
 # Define a list of queue colors
-QUEUE_COLORS = ['red', 'blue', 'green', 'yellow', 'orange', 'purple', 'cyan']
+seven_queue = ["ff00","ffff00",  "ff", "ff0000", "ff00ff", "ffffff", "00ffff"]
 
-# Create a cycle iterator for the queue colors
-color_cycle = cycle(QUEUE_COLORS)
-# Function to get the next color from the queue
-def get_next_color():
-    return next(color_cycle)
+# Function to display the color code
+def display_color():
+    # Get the first color code from the list
+    color_code = seven_queue.pop(0)
+
+    # Add the color code back to the end of the list
+    seven_queue.append(color_code)
+
+    # Return the color code
+    return color_code
 
 global vc_number
 posted_vc = None
@@ -54,6 +64,7 @@ def get_combined_data(request):
 @csrf_exempt
 def picking_plan(request):
     global posted_vc
+    #vc_n_asn.objects.filter(vcn = posted_vc).delete()
     vc_n_asn_data = vc_n_asn.objects.all()
 
     # Define a list to store the combined data
@@ -86,6 +97,7 @@ def picking_plan(request):
             # Add the dictionary to the combined_data list
             combined_data.append(data_entry)
             combined_data = [entry for entry in combined_data if entry['vc_number'] != posted_vc]
+            
             #add code to delete the combined data entry if match posted vc
         else:
             # If no matching model found, append a message to the combined_data list
@@ -105,6 +117,7 @@ def picking_plan(request):
 @csrf_exempt
 def get_Payload_Data(request):
     global posted_vc
+    
     global vc_number
     if request.method == 'POST':
         qr_data = request.POST.get('qr_data')
@@ -114,16 +127,22 @@ def get_Payload_Data(request):
         
     
         try:
+            # Check if all trolleys are engaged
+            if trolley_data.objects.filter(trolley_picking_status="pending").count() >= 7:
+                return JsonResponse({'error': 'All trolleys are currently engaged'}, status=400)
+            # Find the matching trolley based on the QR code
+            matching_trolley = trolley_data.objects.filter(trolley_code=qr_data).first()
+
+            if matching_trolley:
+                # Check if the trolley is already engaged
+                if matching_trolley.trolley_picking_status == "pending":
+                    return JsonResponse({'error': 'This trolley is already engaged'}, status=400)
+
+
+
             vc_n_asn_data = vc_n_asn.objects.all()
             # Get all VC data objects for the given VC number
             vc_data_list = VcDatabase.objects.filter(vc_no=vc_number)
-            # # Define a deque with 7 color codes
-            # color_queue = deque(["ff00", "00ff", "ff0000", "00ff00", "0000ff", "ffff00", "ff00ff"])
-
-            # # Function to get the next color from the queue
-            # def get_next_color():
-            #     return color_queue.popleft()
-
             # Initialize an empty list to store the data for each part number
             data_list = []
 
@@ -134,7 +153,8 @@ def get_Payload_Data(request):
                     # Get the ESL data for the current part number
                     esl_data = EslPart.objects.get(partno=part_number)
                      
-                    queue_color = get_next_color()
+                   
+                    led_color = display_color()
 
                     # Append the data for the current part number to the list
                     data_list.append({
@@ -143,10 +163,10 @@ def get_Payload_Data(request):
                         "QTY": vc_data.quantity,
                         "mac": esl_data.tagid,
                         "ledstate": "0",  # Default value for ledstate
-                        "ledrgb": queue_color,
-                        "outtime": "60",
+                        "ledrgb": led_color,
+                        "outtime": "0",
                         "styleid": "50",
-                        "qrcode": qr_data,
+                        "qrcode": "2001",
                         "mappingtype": "79"
                     })
                 except EslPart.DoesNotExist:
@@ -175,7 +195,33 @@ def get_Payload_Data(request):
                     except VcMaster.DoesNotExist:
                         # Handle the case where the VC number is not found in VcMaster
                         return JsonResponse({'error': 'VC number not found in VcMaster'}, status=404)
-                    AsnSchedule.objects.create(vc_no=posted_vc ,asn_no=asn_number ,model=model_info, start_time =timezone.now() ,color=queue_color ,selection_status=1)
+                    try:
+                        # Create AsnSchedule object
+                        asn_schedule_created = AsnSchedule.objects.create(vc_no=posted_vc, asn_no=asn_number, model=model_info, start_time=timezone.now(), trqr=qr_data, color=led_color)
+                        
+                        if asn_schedule_created:
+                            # Check if the trqr matches any trolley_code
+                            matching_trolley = trolley_data.objects.filter(trolley_code=qr_data).first()
+                            trolley_mac=matching_trolley.mac
+                            matching_trolley.trolley_picking_status="pending"
+                            matching_trolley.save()
+                            print('trolley_mac:',trolley_mac)
+                            if matching_trolley:
+                                # Construct payload for trolley screen update
+                                trolley_payload = [
+                                {"mac": trolley_mac,"mappingtype":135,"styleid":54,"qrcode":"","Status":"PENDING","MODEL":asn_schedule_created.model,"VC":asn_schedule_created.vc_no,"ASN":asn_schedule_created.asn_no,"ledrgb":led_color,"ledstate":"0","outtime":"0"}]
+                                
+                                # Send POST request to update trolley screen
+                                response = requests.post('http://192.168.1.100/wms/associate/updateScreen', json=trolley_payload)
+                                response.raise_for_status()
+                            else:
+                                return JsonResponse({'error': 'No matching trolley found'}, status=404)  # Return error if no matching trolley found
+                        else:
+                            return JsonResponse({'error': 'ASN Schedule not created'}, status=500)  # Internal server error if ASN schedule not created
+
+                    except Exception as e:
+                        return JsonResponse({'error': str(e)}, status=500)  # Return error response with the exception message
+
                     for item in data_list:
                         WorkTable.objects.create(
                             tagid=item['mac'],
@@ -204,11 +250,39 @@ def get_Payload_Data(request):
         return JsonResponse({'error': 'Invalid request'}, status=400)
   
 def kitting_in_process(request):
+    try:
+        # Subquery to check if there are any entries with pending status for the same ASN number
+        pending_subquery = WorkTable.objects.filter(
+            asn=OuterRef('asn'), status='pending'
+        )
+
+        # Annotate each ASN number with a flag indicating if any entry has a pending status
+        completed_work_table = WorkTable.objects.annotate(
+            any_pending=Exists(pending_subquery)
+        )
+        
+        # Filter to get only those ASN numbers where all entries are completed and none has a pending status
+        filtered_work_table = completed_work_table.values('asn').annotate(
+            completed_count=Count('id', filter=Q(status='completed')),
+        ).filter(
+            completed_count=Count('id'),
+            any_pending=False,
+        )
+
+        # Get the distinct ASN numbers from the filtered queryset
+        completed_asn_values = [item['asn'] for item in filtered_work_table]
+        
+        # Filter AsnSchedule objects based on the completed ASN numbers
+        kitting_in_process_data = AsnSchedule.objects.exclude(asn_no__in=completed_asn_values).distinct('asn_no')
+         
     
-    kitting_in_process_data = AsnSchedule.objects.all()
+    #kitting_in_process_data = AsnSchedule.objects.all()
+   
 
-    return render(request, 'kitting_in_process.html', {'kitting_in_process_data': kitting_in_process_data})
-
+        return render(request, 'kitting_in_process.html', {'kitting_in_process_data': kitting_in_process_data})
+    except AsnSchedule.DoesNotExist:
+        return render(request, 'kitting_in_process.html', {'kitting_in_process_data': None})
+   
 @csrf_exempt
 def open_modal(request):
     if request.method == 'POST':
@@ -246,11 +320,70 @@ def enter_key(request):
         print('this is mac:',mac_address )
     WorkTable_objects = WorkTable.objects.filter(tagid=mac_address)
     WorkTable_objects.update(status='completed' , eddatetime = timezone.now())
+    try:
+        # Subquery to check if there are any entries with pending status for the same ASN number
+        pending_subquery = WorkTable.objects.filter(
+            asn=OuterRef('asn'), status='pending'
+        )
+
+        # Annotate each ASN number with a flag indicating if any entry has a pending status
+        completed_work_table = WorkTable.objects.annotate(
+            any_pending=Exists(pending_subquery)
+        )
+        
+        # Filter to get only those ASN numbers where all entries are completed and none has a pending status
+        filtered_work_table = completed_work_table.values('asn').annotate(
+            completed_count=Count('id', filter=Q(status='completed')),
+        ).filter(
+            completed_count=Count('id'),
+            any_pending=False,
+        )
+
+        # Get the distinct ASN numbers from the filtered queryset
+        completed_asn_values = [item['asn'] for item in filtered_work_table]
+        
+        
+        # Filter AsnSchedule objects based on the completed ASN numbers
+        completed_picks = AsnSchedule.objects.filter(asn_no__in=completed_asn_values).distinct('asn_no')
+            # Iterate over completed picks to update trolley payload status
+        completed_trqrs = completed_picks.values_list('trqr', flat=True)
+        # Filter trolley_data based on the trqrs from completed picks
+        matching_trolleys = trolley_data.objects.filter(trolley_code__in=completed_trqrs)
+        # Initialize an empty list to store trolley_mac values
+        trolley_macs = []
+        # Iterate over matching trolleys, update their status to completed, and collect their mac addresses
+        for trolley in matching_trolleys:
+            trolley.trolley_picking_status = "completed"
+            trolley.save()
+            trolley_macs.append(trolley.mac)
+        
+            try:
+                trolley_macs.append(trolley.mac)
+                
+                # Construct payload for trolley screen update
+                for mac in trolley_macs:
+                    trolley_payload = [
+                                    {"mac": mac,"mappingtype":135,"styleid":54,"qrcode":"","Status":"COMPLETED","MODEL":"pick.model","VC":"pick.vc_no","ASN":"pick.asn_no","ledrgb":"ff07","ledstate":"0","outtime":"3"}
+                                    
+                                    ]
+                                
+                # Send POST request to update trolley picking status 
+                response = requests.post('http://192.168.1.100/wms/associate/updateScreen', json=trolley_payload)
+                response.raise_for_status()
+                
+            except trolley_data.DoesNotExist:
+                # Handle the case where no matching trolley data is found
+                pass
+
+        
+
+    except AsnSchedule.DoesNotExist:
+
    
 
-    return JsonResponse({'message': 'Request processed successfully'}) 
+        return JsonResponse({'message': 'Request processed successfully'}) 
 
-from django.db.models import Count, Exists, OuterRef ,Q
+
 
 def completed_kittings(request):
     try:
@@ -277,6 +410,7 @@ def completed_kittings(request):
         
         # Filter AsnSchedule objects based on the completed ASN numbers
         completed_picks = AsnSchedule.objects.filter(asn_no__in=completed_asn_values).distinct('asn_no')
+         
 
         return render(request, 'completed_kittings.html', {'completed_picks': completed_picks})
     
